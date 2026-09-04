@@ -3,7 +3,6 @@ import time
 from dotenv import load_dotenv
 
 load_dotenv()
-print("Is Tracing On?", os.getenv("LANGCHAIN_TRACING_V2"))
 
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
@@ -11,6 +10,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 import yfinance as yf
 import requests
+import feedparser
+import urllib.parse
 
 # Get API key
 load_dotenv()
@@ -27,6 +28,7 @@ class MarketState(TypedDict):
     current_price: float
     weather_summary: str
     news_headlines: List[str]
+    news_sentiment: str
     trade_signal: str
     reasoning: str
 
@@ -89,8 +91,58 @@ def data_fetcher_node(state: MarketState):
 
 def news_analyst_node(state: MarketState):
     print("-- Analyzing Geopolitical News --")
+    commodity = state.get("commodity", "")
+
+    # Search query based on market region
+    if "EU" in commodity:
+        query = "European natural gas TTF energy supply"
+    else:
+        query = "US natural gas Henry Hub LNG production"
+
+    encoded_query = urllib.parse.quote(query)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+
+    headlines = []
+    try:
+        feed = feedparser.parse(rss_url)
+        # Get top 3 headlines
+        for entry in feed.entries[:3]:
+            headlines.append(entry.title)
+        print(f"News Analyst: Retrieved {len(headlines)} headlines.")
+    except Exception as e:
+        print(f"News Analyst RSS Error: {e}")
+        headlines = ["No live headlines available."]
+
+    # Gemini analyze news sentiment
+    news_context = "\n".join([f"- {h}" for h in headlines])
+    prompt = f"""
+    You are an energy news analyst. Review these recent headlines for {commodity}:
+    {news_context}
+    
+    Determine if the overall news sentiment is BULLISH, BEARISH, or NEUTRAL for natural gas prices.
+    Rules:
+    - Supply cuts, pipeline shutdowns, strikes, or high demand are BULLISH.
+    - Production increases, mild demand, or full gas storage are BEARISH.
+    - Mixed or routine news is NEUTRAL.
+
+    Respond in EXACTLY this format:
+    SENTIMENT | One-sentence summary of why
+    Example: BULLISH | Pipeline maintenance in Norway limits export capacity.
+    """
+
+    sentiment = "NEUTRAL"
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content[0].get("text", "") if isinstance(response.content, list) else response.content
+        parts = str(raw_text).strip().split("|")
+        if len(parts) == 2:
+            sentiment = parts[0].strip()
+    except Exception as e:
+        print(f"News Analyst LLM Error: {e}")
+
     return {
-        "news_headlines": ["EU struggles to fill gas reserves before winter."]
+        "news_headlines": headlines,
+        "news_sentiment": sentiment
     }
 
 def supervisor_node(state: MarketState):
@@ -99,6 +151,9 @@ def supervisor_node(state: MarketState):
     price = state.get("current_price")
     weather = state.get("weather_summary", "")
     commodity = state.get("commodity", "")
+    news_sentiment = state.get("news_sentiment", "NEUTRAL")
+    headlines = state.get("news_headlines", [])
+    headlines_text = "\n".join(headlines[:2])
 
     # System Prompt
     system_instruction = """ 
@@ -125,7 +180,14 @@ def supervisor_node(state: MarketState):
     """
 
     # Package data for LLM
-    user_data = f"Commodity: {commodity}\nCurrent Price: {price}\nWeather: {weather}"
+    user_data = f"""
+    Commodity: {commodity}
+    Current Price: ${price}
+    Weather Demand Context: {weather}
+    News Sentiment: {news_sentiment}
+    Key Headlines:
+    {headlines_text}
+    """
 
     # LLM call
     messages = [
@@ -180,7 +242,7 @@ energy_app = workflow.compile()
 
 # Test
 if __name__ == "__main__":
-    initial_state = {"commodity": "Natural Gas (US)"}
+    initial_state = {"commodity": "Natural Gas (EU)"}
     final_state = energy_app.invoke(initial_state)
 
     print("\n-- Final Trading Report --")
