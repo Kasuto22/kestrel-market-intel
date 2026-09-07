@@ -12,6 +12,8 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, StateGraph
 from langchain.agents import create_agent
+from langgraph.checkpoint.postgres import PostgresSaver
+from database import pool
 
 
 # Get API key
@@ -264,12 +266,22 @@ workflow.add_edge("Data_Fetcher", "News_Analyst")
 workflow.add_edge("News_Analyst", "Supervisor")
 workflow.add_edge("Supervisor", END)
 
-energy_app = workflow.compile()
+# Create database memory and tables automatically
+saver = PostgresSaver(pool)
+saver.setup()
+
+# Compile with checkpointer attached
+energy_app = workflow.compile(checkpointer=saver)
 
 # Test
 if __name__ == "__main__":
+    # Unique ID for this run
+    config = {"configurable": {"thread_id": "trading_desk_session_01"}}
+
     initial_state = {"commodity": "Natural Gas (EU)"}
-    final_state = energy_app.invoke(initial_state)
+
+    # Pass config with initial state
+    final_state = energy_app.invoke(initial_state, config=config)
 
     print("\n-- Final Trading Report --")
     print(f"Commodity: {final_state['commodity']}")
@@ -278,3 +290,5 @@ if __name__ == "__main__":
     print(f"Reasoning: {final_state['reasoning']}")
     print("Flushing traces to LangSmith...")
     time.sleep(3) # Wait 3 seconds before killing the script
+    # Cleanly shut down the database background threads
+    pool.close()
