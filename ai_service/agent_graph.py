@@ -14,6 +14,7 @@ from langgraph.graph import END, StateGraph
 from langchain.agents import create_agent
 from langgraph.checkpoint.postgres import PostgresSaver
 from database import pool
+from rag_tools import lookup_regulatory_policy
 
 
 # Get API key
@@ -28,10 +29,13 @@ llm = ChatGoogleGenerativeAI(
 # Defined State
 class MarketState(TypedDict):
     commodity: str
+    location: str
     current_price: float
+    price_status: str
     weather_summary: str
     news_headlines: List[str]
     news_sentiment: str
+    regulatory_context: str
     trade_signal: str
     reasoning: str
 
@@ -55,20 +59,20 @@ def fetch_news_headlines(query: str) -> str:
         return f"Tool Error: {e}"
 
 # Prompt for the autonomous agent
-news_agent_prompt = """You are an expert energy news analyst. 
-1. Use the fetch_news_headlines tool to gather recent news for the requested market. 
-2. If the results aren't helpful, try the tool again with a different, more specific query.
-3. Determine if the overall news sentiment is BULLISH, BEARISH, or NEUTRAL for natural gas prices.
+news_agent_prompt = """You are an expert energy market analyst.
+1. Use fetch_news_headlines to gather recent events for the requested commodity.
+2. Use lookup_regulatory_policy with the appropriate region ('EU' or 'US') to verify any storage mandates, infrastructure constraints, or regulatory rules affecting supply and demand.
+3. Synthesize your findings into an overall market sentiment: BULLISH, BEARISH, or NEUTRAL.
 
-Format your final response EXACTLY as a strict string separated by a pipe character:
-SENTIMENT | One-sentence summary of the headlines
-Example: BULLISH | Pipeline maintenance in Norway limits export capacity.
+Format your final response EXACTLY as a strict string separated by two pipe characters:
+SENTIMENT || SUMMARY || REGULATORY_NOTE
+Example: BULLISH || Escalating supply risks in Norway || Under REPowerEU mandates, storage targets require accelerated injection schedules.
 """
 
 # ReAct agent
 news_agent = create_agent(
     model=llm,
-    tools=[fetch_news_headlines],
+    tools=[fetch_news_headlines, lookup_regulatory_policy],
     system_prompt=news_agent_prompt
 )
 
@@ -77,67 +81,106 @@ news_agent = create_agent(
 def data_fetcher_node(state: MarketState):
     print("-- Fetching Market Data --")
 
-    # Read commodity from the State to get correct ticker
     commodity = state.get("commodity", "")
+    user_location = state.get("location", "").strip()
 
-    # Dynamic Routing based on Market Region
-    if "EU" in commodity:
-        ticker = "TTF=F"
-        lat, lon = "52.52", "13.41" # Berlin, Germany
-        region_name = "Berlin (EU Proxy)"
-        temp_unit = "°C"
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
-    else:
-        ticker = "NG=F"
-        lat, lon = "29.76", "-95.36" # Houston, TX (US Proxy)
-        region_name = "Houston (US Proxy)"
-        temp_unit = "°F"
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&temperature_unit=fahrenheit"
+    # Determine region defaults
+    is_eu = "EU" in commodity
+    ticker = "TTF=F" if is_eu else "NG=F"
+    temp_unit = "°C" if is_eu else "°F"
+
+    # Resolve Location Coordinates
+    target_location = user_location if user_location else ("Berlin" if is_eu else "Houston")
+    lat, lon = None, None
+    resolved_name = target_location
 
     try:
-        # Expand lookback to 5 days for weekends and market holidays
+        geocode_url = f"https://geocoding-api.open-meteo.com/v1/search?name={target_location}&count=1&format=json"
+        geo_resp = requests.get(geocode_url, timeout=5)
+        
+        if geo_resp.status_code == 200:
+            geo_data = geo_resp.json()
+            if "results" in geo_data and len(geo_data["results"]) > 0:
+                top_match = geo_data["results"][0]
+                lat = top_match["latitude"]
+                lon = top_match["longitude"]
+                resolved_name = f"{top_match.get('name', target_location)}, {top_match.get('country_code', '')}"
+                print(f"Data Fetcher: Geocoded '{target_location}' to {resolved_name} ({lat}, {lon})")
+            else:
+                print(f"Data Fetcher: Location '{target_location}' not found. Using regional fallback.")
+        else:
+            print(f"Data Fetcher: Geocoding API returned status code {geo_resp.status_code}")
+    except Exception as e:
+        print(f"Data Fetcher Error (Geocoding): {e}")
+
+    # Fallbacks if geocoding returns no match or fails
+    if lat is None or lon is None:
+        if is_eu:
+            lat, lon = 52.52, 13.41
+            resolved_name = "Berlin (EU Fallback)"
+        else:
+            lat, lon = 29.76, -95.36
+            resolved_name = "Houston (US Fallback)"
+
+    # Fetch Market Price via yfinance
+    current_price = None
+    try:
         asset_data = yf.Ticker(ticker)
         recent_history = asset_data.history(period="5d")
 
+        # If a 5-day window is empty, expand lookback
+        if recent_history.empty:
+            recent_history = asset_data.history(period="1mo")
+
         if not recent_history.empty:
-            # Grab the most recent closing price from the 5-day window
             current_price = round(float(recent_history["Close"].iloc[-1]), 2)
-            print(f"Data Fetcher: Successfully retrieved {ticker} closing price at {current_price}.")
+            last_date = recent_history.index[-1].strftime("%Y-%m-%d")
+            print(f"Data Fetcher: Retrieved {ticker} last close: ${current_price} ({last_date})")
         else:
-            # Graceful Fallback if Yahoo delists the ticker
-            current_price = 71.50 if "EU" in commodity else 2.90
-            print(f"Data Fetcher: Market data unavailable for {ticker}. Using fallback price: ${current_price}")
-            
+            print(f"Data Fetcher Warning: No historical market data returned for {ticker}.")
     except Exception as e:
-        print(f"Data Fetcher Error: {e}")
-        current_price = 71.50 if "EU" in commodity else 2.90
+        print(f"Data Fetcher Error (Market): {e}")
 
-    # Get Dynamic Weather Data
-    weather_summary = "Weather data unavailable."
+    # Fallback to None rather than a synthetic price
+    if current_price is None:
+        price_status = "Market price currently unavailable."
+    else:
+        price_status = f"Last closing price: ${current_price}"
+
+    # Fetch Dynamic Weather Data
+    weather_unit_param = "" if is_eu else "&temperature_unit=fahrenheit"
+    weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true{weather_unit_param}"
+    
+    weather_summary = f"Weather data unavailable for {resolved_name}."
     try:
-        response = requests.get(url)
-
-        if response.status_code == 200:
-            data = response.json()
-            temp = data["current_weather"]["temperature"]
-            weather_summary = f"Current temperature in {region_name} is {temp}{temp_unit}."
+        w_resp = requests.get(weather_url, timeout=5)
+        if w_resp.status_code == 200:
+            w_data = w_resp.json()
+            temp = w_data["current_weather"]["temperature"]
+            weather_summary = f"Current temperature in {resolved_name} is {temp}{temp_unit}."
             print(f"Data Fetcher: Weather retrieved - {weather_summary}")
         else:
-            print(f"Data Fetcher: Weather API returned status code {response.status_code}")
+            print(f"Data Fetcher: Weather API returned status code {w_resp.status_code}")
     except Exception as e:
         print(f"Data Fetcher Error (Weather): {e}")
 
     return {
         "current_price": current_price,
+        "price_status": price_status,
         "weather_summary": weather_summary
     }
 
 def news_analyst_node(state: MarketState):
-    print("-- Analyzing Geopolitical News via Autonomous Sub-Agent --")
+    print("-- Analyzing Geopolitical News & Policy via Autonomous Sub-Agent --")
     commodity = state.get("commodity", "")
+    region = "EU" if "EU" in commodity else "US"
 
     # Trigger autonomous agent loop
-    inputs = {"messages": [HumanMessage(content=f"Find market news for {commodity} and determine the sentiment.")]}
+    inputs = {
+        "messages": [
+            HumanMessage(content=f"Analyze current news and regulatory policy for {commodity} in region {region}.")
+        ]
+    }
 
     try:
         # Agent loop (Reason -> Call Tool -> Observe -> Answer)
@@ -150,25 +193,33 @@ def news_analyst_node(state: MarketState):
         if isinstance(final_content, list):
             final_text = final_content[0].get("text", "")
         else:
-            final_text = final_content
+            final_text = str(final_content)
 
         # Parse
-        parts = str(final_text).strip().split("|")
-        if len(parts) == 2:
+        parts = final_text.strip().split("||")
+        if len(parts) >= 3:
             sentiment = parts[0].strip()
             summary = parts[1].strip()
+            regulatory_note = parts[2].strip()
+        elif len(parts) == 2:
+            sentiment = parts[0].strip()
+            summary = parts[1].strip()
+            regulatory_note = "No specific policy retrieved."
         else:
             sentiment = "NEUTRAL"
             summary = final_text
+            regulatory_note = "Standard regulatory baseline."
 
     except Exception as e:
-        print(f"News Agent Error: {e}")
+        print(f"News/Policy Agent Error: {e}")
         sentiment = "NEUTRAL"
-        summary = "Failed to analyze news autonomously."
+        summary = "Failed to run autonomous analysis."
+        regulatory_note = "Policy lookup failed."
 
     return {
         "news_headlines": [summary],
-        "news_sentiment": sentiment
+        "news_sentiment": sentiment,
+        "regulatory_context": regulatory_note
     }
 
     
@@ -209,12 +260,13 @@ def supervisor_node(state: MarketState):
 
     # Package data for LLM
     user_data = f"""
-    Commodity: {commodity}
-    Current Price: ${price}
-    Weather Demand Context: {weather}
-    News Sentiment: {news_sentiment}
-    Key Headlines:
-    {headlines_text}
+    Commodity: {state.get('commodity')}
+    Location: {state.get('location')}
+    Price Status: {state.get('price_status')}
+    Weather Context: {state.get('weather_summary')}
+    News Sentiment: {state.get('news_sentiment')}
+    Headlines: {state.get('news_headlines')}
+    Regulatory Constraints: {state.get('regulatory_context')}
     """
 
     # LLM call
