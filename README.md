@@ -34,9 +34,9 @@ The system is being built around:
 - [x] LangGraph state
 - [x] Initial agent graph
 - [x] Data fetcher agent
-- [ ] News analysis agent
-- [ ] Database integration
-- [ ] RAG pipeline
-- [ ] API layer
+- [x] News analysis agent
+- [x] Database integration
+- [x] RAG pipeline
+- [x] API layer
 - [ ] Frontend
 - [ ] Evaluation
